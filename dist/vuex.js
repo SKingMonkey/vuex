@@ -74,12 +74,11 @@ var mapState = normalizeNamespace(function (namespace, states) {
       var state = this.$store.state
       var getters = this.$store.getters
       if (namespace) {
-        var module = this.$store._modulesNamespaceMap[namespace]
+        var module = getModuleByNamespace(this.$store, 'mapState', namespace)
         if (!module) {
-          warnNamespace('mapState', namespace)
           return
         }
-        state = module.state
+        state = module.context.state
         getters = module.context.getters
       }
       return typeof val === 'function'
@@ -101,6 +100,9 @@ var mapMutations = normalizeNamespace(function (namespace, mutations) {
       var args = [], len = arguments.length;
       while ( len-- ) args[ len ] = arguments[ len ];
 
+      if (namespace && !getModuleByNamespace(this.$store, 'mapMutations', namespace)) {
+        return
+      }
       return this.$store.commit.apply(this.$store, [val].concat(args))
     }
   })
@@ -115,8 +117,12 @@ var mapGetters = normalizeNamespace(function (namespace, getters) {
 
     val = namespace + val
     res[key] = function mappedGetter () {
+      if (namespace && !getModuleByNamespace(this.$store, 'mapGetters', namespace)) {
+        return
+      }
       if (!(val in this.$store.getters)) {
         console.error(("[vuex] unknown getter: " + val))
+        return
       }
       return this.$store.getters[val]
     }
@@ -135,6 +141,9 @@ var mapActions = normalizeNamespace(function (namespace, actions) {
       var args = [], len = arguments.length;
       while ( len-- ) args[ len ] = arguments[ len ];
 
+      if (namespace && !getModuleByNamespace(this.$store, 'mapActions', namespace)) {
+        return
+      }
       return this.$store.dispatch.apply(this.$store, [val].concat(args))
     }
   })
@@ -159,8 +168,12 @@ function normalizeNamespace (fn) {
   }
 }
 
-function warnNamespace (helper, namespace) {
-  console.error(("[vuex] module namespace not found in " + helper + "(): " + namespace))
+function getModuleByNamespace (store, helper, namespace) {
+  var module = store._modulesNamespaceMap[namespace]
+  if (!module) {
+    console.error(("[vuex] module namespace not found in " + helper + "(): " + namespace))
+  }
+  return module
 }
 
 /**
@@ -565,21 +578,21 @@ function installModule (store, rootState, path, module, hot) {
     })
   }
 
-  var local = module.context = makeLocalContext(store, namespace)
+  var local = module.context = makeLocalContext(store, namespace, path)
 
   module.forEachMutation(function (mutation, key) {
     var namespacedType = namespace + key
-    registerMutation(store, namespacedType, mutation, path)
+    registerMutation(store, namespacedType, mutation, local)
   })
 
   module.forEachAction(function (action, key) {
     var namespacedType = namespace + key
-    registerAction(store, namespacedType, action, local, path)
+    registerAction(store, namespacedType, action, local)
   })
 
   module.forEachGetter(function (getter, key) {
     var namespacedType = namespace + key
-    registerGetter(store, namespacedType, getter, local, path)
+    registerGetter(store, namespacedType, getter, local)
   })
 
   module.forEachChild(function (child, key) {
@@ -588,10 +601,10 @@ function installModule (store, rootState, path, module, hot) {
 }
 
 /**
- * make localized dispatch, commit and getters
+ * make localized dispatch, commit, getters and state
  * if there is no namespace, just use root ones
  */
-function makeLocalContext (store, namespace) {
+function makeLocalContext (store, namespace, path) {
   var noNamespace = namespace === ''
 
   var local = {
@@ -630,10 +643,17 @@ function makeLocalContext (store, namespace) {
     }
   }
 
-  // getters object must be gotten lazily
-  // because store.getters will be changed by vm update
-  Object.defineProperty(local, 'getters', {
-    get: noNamespace ? function () { return store.getters; } : function () { return makeLocalGetters(store, namespace); }
+  // getters and state object must be gotten lazily
+  // because they will be changed by vm update
+  Object.defineProperties(local, {
+    getters: {
+      get: noNamespace
+        ? function () { return store.getters; }
+        : function () { return makeLocalGetters(store, namespace); }
+    },
+    state: {
+      get: function () { return getNestedState(store.state, path); }
+    }
   })
 
   return local
@@ -662,21 +682,21 @@ function makeLocalGetters (store, namespace) {
   return gettersProxy
 }
 
-function registerMutation (store, type, handler, path) {
+function registerMutation (store, type, handler, local) {
   var entry = store._mutations[type] || (store._mutations[type] = [])
   entry.push(function wrappedMutationHandler (payload) {
-    handler(getNestedState(store.state, path), payload)
+    handler(local.state, payload)
   })
 }
 
-function registerAction (store, type, handler, local, path) {
+function registerAction (store, type, handler, local) {
   var entry = store._actions[type] || (store._actions[type] = [])
   entry.push(function wrappedActionHandler (payload, cb) {
     var res = handler({
       dispatch: local.dispatch,
       commit: local.commit,
       getters: local.getters,
-      state: getNestedState(store.state, path),
+      state: local.state,
       rootGetters: store.getters,
       rootState: store.state
     }, payload, cb)
@@ -694,14 +714,14 @@ function registerAction (store, type, handler, local, path) {
   })
 }
 
-function registerGetter (store, type, rawGetter, local, path) {
+function registerGetter (store, type, rawGetter, local) {
   if (store._wrappedGetters[type]) {
     console.error(("[vuex] duplicate getter key: " + type))
     return
   }
   store._wrappedGetters[type] = function wrappedGetter (store) {
     return rawGetter(
-      getNestedState(store.state, path), // local state
+      local.state, // local state
       local.getters, // local getters
       store.state, // root state
       store.getters // root getters
